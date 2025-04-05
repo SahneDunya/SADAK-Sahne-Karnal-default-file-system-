@@ -1,1 +1,2 @@
-# SADAK-Sahne-Karnal-default-file-system-
+# SADAK (Sahne Karnal default file system)
+SADAK is the standard file system of Sahne Karnal architecture developed by Sahne Dünya. SADAK file system is specific to Sahne Karnal series kernels! SADAK file system is known for its high performance and multi-platform file support, for example Sahne Dünya is a fully compatible operating system with Unix although it is not Unix and supports ELF and BIN formats but the default executable file of Sahne Karnal architecture is GAXE! SADAK can support and read a wide range of file formats but let's not forget that it is specific to Sahne Karnal architecture only and is a user space software! Another nice feature is that it is fully compatible with both Mobile and PC platforms!
