@@ -1,4 +1,3 @@
-// srcfileavı.rs
 #![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
 #![cfg_attr(not(feature = "std"), no_std)]
 
@@ -328,8 +327,8 @@ fn parse_avi_internal<R: StdRead + StdSeek>(reader: &mut R) -> Result<AviData, S
      // hdrl LIST'inin sonu = hdrl LIST'inin başlangıcı + hdrl LIST'inin boyutu
      // RIFF başlığından sonra (8. byte) LIST 'hdrl' başlar.
      // LIST 'hdrl' başlangıcı = 12. byte (RIFF size + type + AVI type + LIST type = 4+4+4+4 = 16? No, 8 bytes size+type for each atom/list)
-     // RIFF (size + type) = 8 bytes
-     // AVI (type) = 4 bytes
+      RIFF (size + type) = 8 bytes
+      AVI (type) = 4 bytes
      // LIST (size + type) = 8 bytes -> hdrl LIST starts at byte 12 (0-indexed) in the original file
      // The first LIST header (size+type) is at offset 8. The 'hdrl' type is at offset 12.
      // So the hdrl LIST starts at offset 8 + 4 (List size) + 4 (List type 'LIST'). RIFF size + type is 8. AVI type is 4.
@@ -940,4 +939,109 @@ fn map_core_io_error_to_fs_error(e: CoreIOError) -> FileSystemError {
 
 // Helper function to map SahneError to FileSystemError (defined earlier, copy here for clarity)
 #[cfg(not(feature = "std"))]
-fn map_sahne_error_to_fs_error(e: SahneError) -> FileSystem
+fn map_sahne_error_to_fs_error(e: SahneError) -> FileSystemError {
+    FileSystemError::IOError(format!("SahneError: {:?}", e))
+}
+
+
+// Example main functions
+#[cfg(feature = "example_avi")] // Different feature flag
+fn main() -> Result<(), FileSystemError> { // Return FileSystemError
+     #[cfg(not(feature = "std"))]
+     {
+          eprintln!("AVI parsing example (no_std) starting...");
+          // TODO: Call init_console(crate::Handle(3)); if needed
+     }
+     #[cfg(feature = "std")]
+     {
+          eprintln!("AVI parsing example (std) starting...");
+     }
+
+     // Test with a hypothetical file/resource ID
+     let file_path_or_resource_id = "sahne://files/video.avi";
+
+     match parse_avi(file_path_or_resource_id) {
+         Ok(avi_data) => {
+             println!("AVI File Parsed Successfully!\n");
+             println!("AVI Main Header: {:?}", avi_data.main_header);
+             println!("\nStream Headers: {:?}", avi_data.stream_headers);
+             println!("\nTotal Chunk Count: {}", avi_data.chunks.len());
+              for chunk in &avi_data.chunks {
+                  println!("\nChunk ID: {}, Size: {} bytes, First 16 bytes: {:?}...",
+                           fourcc_to_string(chunk.id), chunk.size, &chunk.data[..cmp::min(16, chunk.data.len())]);
+              }
+         }
+         Err(e) => {
+             eprintln!("AVI Parsing Error for '{}': {}", file_path_or_resource_id, e);
+         }
+     }
+
+     #[cfg(not(feature = "std"))]
+     eprintln!("AVI parsing example (no_std) finished.");
+     #[cfg(feature = "std")]
+     eprintln!("AVI parsing example (std) finished.");
+
+     Ok(())
+}
+
+// Test module
+#[cfg(test)]
+#[cfg(feature = "std")] // std feature and test attribute
+mod tests {
+    use super::*;
+    use std::io::Cursor; // In-memory reader/seeker
+    use alloc::vec; // vec! macro
+    use alloc::string::ToString; // to_string()
+
+     // Helper to create a basic RIFF AVI header in memory
+     fn create_basic_avi_header() -> Vec<u8> {
+         let mut data = vec![];
+         data.extend_from_slice(&CKID_RIFF.to_le_bytes()); // RIFF
+         data.extend_from_slice(&0u32.to_le_bytes()); // File size (placeholder)
+         data.extend_from_slice(&CKID_AVI.to_le_bytes()); // AVI
+         data.extend_from_slice(&CKID_LIST.to_le_bytes()); // LIST
+         data.extend_from_slice(&0u32.to_le_bytes()); // LIST size (placeholder)
+         data.extend_from_slice(&CKID_hdrl.to_le_bytes()); // hdrl
+         data.extend_from_slice(&CKID_avih.to_le_bytes()); // avih
+         data.extend_from_slice(&56u32.to_le_bytes()); // avih size (56 bytes for AviMainHeader)
+         // Dummy AviMainHeader data (56 bytes)
+         for _ in 0..56 { data.push(0); }
+         data
+     }
+
+     #[test]
+     fn test_parse_avi_basic_header() {
+         let mut data = create_basic_avi_header();
+         // Add some dummy content after hdrl LIST for parse_avi_internal to iterate
+         data.extend_from_slice(&CKID_movi.to_le_bytes()); // Add movi list placeholder
+         data.extend_from_slice(&8u32.to_le_bytes()); // movi list size (dummy)
+         data.extend_from_slice(&CKID_movi.to_le_bytes()); // movi list type (dummy)
+         // Correct the LIST hdrl size
+         let list_hdrl_content_size = data.len() - 12 - 8; // Total size - RIFF(8) - AVI(4) - LIST header(8)
+         let list_hdrl_total_size = list_hdrl_content_size + 4; // Content size + LIST type size
+         let list_hdrl_header_size_offset = 8 + 4; // After RIFF header and AVI type
+          let list_hdrl_size_bytes = (list_hdrl_total_size as u32).to_le_bytes();
+          data[list_hdrl_header_size_offset..list_hdrl_header_size_offset+4].copy_from_slice(&list_hdrl_size_bytes);
+
+          // Correct the overall file size in the RIFF header
+           let total_file_size = data.len() - 8; // Total size - RIFF header size (8)
+           let riff_size_bytes = (total_file_size as u32).to_le_bytes();
+            data[4..8].copy_from_slice(&riff_size_bytes);
+
+
+         let mut reader = Cursor::new(data);
+         let result = parse_avi_internal(&mut reader); // Call the internal parser
+         assert!(result.is_ok(), "Parsing failed: {:?}", result.err());
+         let avi_data = result.unwrap();
+
+         assert_eq!(avi_data.stream_headers.len(), 0); // Basic header has no streams
+         assert_eq!(avi_data.chunks.len(), 0); // Basic header has no movie chunks
+         // Can check main_header fields if dummy data was specific.
+     }
+
+     // TODO: Add more comprehensive tests with actual AVI structure simulation (ftyp, movi, strl, chunks)
+     // TODO: Add tests for error conditions (invalid headers, truncated file, etc.)
+     // TODO: Add tests specifically for the no_std implementation using a mock SahneResourceReader
+}
+
+// Redundant no_std print module and panic handler removed.
