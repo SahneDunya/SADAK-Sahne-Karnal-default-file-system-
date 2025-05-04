@@ -1,6 +1,3 @@
-// srcfilesvg.rs
-// SVG parser for Sahne64 (using xml-rs or similar no_std XML parser)
-
 #![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
 #![cfg_attr(not(feature = "std"), no_std)] // Standart kütüphaneye ihtiyaç duymuyoruz
 
