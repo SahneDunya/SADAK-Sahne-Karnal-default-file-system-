@@ -2,13 +2,14 @@
 
 // Gerekli Sahne64 modüllerini içeri aktar
 use crate::{
-    fs,
+    resource, // fs modülü yerine resource modülü kullanıldı
     memory,
-    process,
+    task,     // process modülü yerine task modülü kullanıldı
     sync,
     kernel,
     SahneError,
     arch,
+    Handle,   // Handle tipi eklendi
 };
 
 /// Trait defining the interface for abstract block devices.
@@ -46,11 +47,11 @@ pub trait AbstractDevice {
 
 /// Enum to handle different types of devices.
 pub enum DeviceHandle {
-    /// Represents a file-backed device, using a Sahne64 file descriptor.
-    File(u64),
+    /// Represents a resource-backed device, using a Sahne64 Handle.
+    Resource(Handle), // File(u64) yerine Resource(Handle) kullanıldı
     // Future device types can be added here, e.g.,
-    // UsbDevice(UsbDeviceImpl),
-    // NvmeDevice(NvmeDeviceImpl),
+    UsbDevice(UsbDeviceImpl),
+    NvmeDevice(NvmeDeviceImpl),
 }
 
 /// Represents a block device built on top of a DeviceHandle.
@@ -65,7 +66,7 @@ impl BlockDevice {
     ///
     /// # Arguments
     ///
-    /// * `device` - The underlying device handle (Sahne64 file descriptor).
+    /// * `device` - The underlying device handle (Sahne64 resource Handle).
     /// * `block_size` - The size of each block in bytes.
     /// * `block_count` - The total number of blocks.
     pub fn new(device: DeviceHandle, block_size: u64, block_count: u64) -> Self {
@@ -80,34 +81,42 @@ impl BlockDevice {
 impl AbstractDevice for BlockDevice {
     fn read_block(&mut self, block_number: u64, buffer: &mut [u8]) -> Result<usize, SahneError> {
         match &mut self.device {
-            DeviceHandle::File(fd) => {
+            DeviceHandle::Resource(handle) => { // File(fd) yerine Resource(handle) kullanıldı
                 let offset = block_number * self.block_size;
-                // Sahne64'te seek benzeri bir sistem çağrısı olmayabilir.
-                // Bu durumda, okuma işlemini doğru offsetten başlatmak için
-                // dosya açma sırasında veya başka bir mekanizma ile konum yönetimi gerekebilir.
-                // Şimdilik basitçe okuma yapıyoruz. Gerçek bir blok cihazı için bu yeterli olmayabilir.
-                // Belki de 'ioctl' ile bir seek komutu gönderilebilir.
-                // Ancak bu örnekte, dosyanın başından itibaren okuyacağımızı varsayıyoruz ve
-                // 'read' fonksiyonunun verilen buffer'ı tamamen doldurmasını bekliyoruz.
+                // Sahne64'te doğrudan offsetli okuma/yazma syscall'ları yok (en azından paylaşılan kodda).
+                // Resource::read ve Resource::write muhtemelen kaynağın mevcut konumundan okur/yazar.
+                // Gerçek bir blok cihazı için, okumadan önce kaynağın konumunu 'seek' benzeri
+                // bir mekanizma (muhtemelen resource::control ile) ayarlamak gerekebilir.
+                // Şu anki implementasyon, bu soyutlamanın eksik bir parçasıdır ve
+                // her okuma/yazma çağrısının kaynağın başından başladığını varsayarsa
+                // veya kaynağın durumunu (offsetini) dahili olarak yönettiğini varsayarsa
+                // doğru çalışmaz. Bu, Sahne64 API'sında çözülmesi gereken bir konudur.
+                // Şimdilik, sadece mevcut resource::read fonksiyonunu kullanıyoruz ve
+                // offset yönetiminin API'nin daha alt katmanında (veya resource::control
+                // gibi bir yolla) ele alınması gerektiğini not ediyoruz.
 
-                // Not: Sahne64'te doğrudan offsetli okuma için bir sistem çağrısı gerekebilir.
-                // Şimdilik, okuma yapıp offset'i manuel olarak yönetiyormuş gibi davranacağız.
-                let total_offset = offset as usize;
-                let buffer_len = buffer.len();
+                if buffer.len() as u66 != self.block_size { // buffer.len() bir usize, u64 ile karşılaştırırken dikkatli olmalı
+                    // Veya SahneError::InvalidParameter
+                    return Err(SahneError::InvalidOperation); // Buffer boyutu blok boyutuna eşit olmalı
+                }
 
-                // Geçici bir çözüm olarak, dosyanın başına gitmeyip, doğrudan okuma yapmayı deneyeceğiz.
-                // Gerçek bir uygulamada, offset yönetimi daha dikkatli yapılmalıdır.
-                let read_result = fs::read(*fd, buffer);
+                // Burada ideal olarak bir seek işlemi olurdu:
+                resource::control(*handle, resource::CONTROL_SEEK, offset)?;
+
+                let read_result = resource::read(*handle, buffer); // fs::read yerine resource::read kullanıldı
                 match read_result {
                     Ok(bytes_read) => {
-                        if bytes_read == buffer_len {
-                            Ok(bytes_read)
-                        } else if bytes_read > 0 {
-                            // Kısmi okuma durumu, blok boyutuyla eşleşmeli
-                            Err(SahneError::InvalidOperation) // Veya daha uygun bir hata türü
-                        } else {
-                            Err(SahneError::FileNotFound) // Dosya sonuna gelindi veya hata oluştu
-                        }
+                         // resource::read kaç byte okuduğunu dönmeli.
+                         // Blok cihaz trait'i tam blok okumayı bekler.
+                        if bytes_read == buffer.len() {
+                             Ok(bytes_read)
+                         } else {
+                             // Tam blok okuyamadık, bu bir hata veya dosya sonu olabilir.
+                             // Dosya sistemi mantığına göre bu durum ele alınmalı.
+                             // Örneğin, eğer bytes_read 0 ise dosya sonu.
+                             // Eğer 0 < bytes_read < buffer.len() ise kısmi okuma (genellikle hata).
+                            Err(SahneError::CommunicationError) // Veya daha spesifik bir hata
+                         }
                     }
                     Err(e) => Err(e),
                 }
@@ -117,20 +126,29 @@ impl AbstractDevice for BlockDevice {
 
     fn write_block(&mut self, block_number: u64, buffer: &[u8]) -> Result<usize, SahneError> {
         match &mut self.device {
-            DeviceHandle::File(fd) => {
+            DeviceHandle::Resource(handle) => { // File(fd) yerine Resource(handle) kullanıldı
                 let offset = block_number * self.block_size;
-                // Benzer şekilde, yazma işleminde de offset yönetimi gerekebilir.
-                // Şimdilik basitçe yazma yapıyoruz.
+                 // Offset yönetimi notu burada da geçerli.
 
-                // Not: Sahne64'te doğrudan offsetli yazma için bir sistem çağrısı gerekebilir.
-                let write_result = fs::write(*fd, buffer);
+                if buffer.len() as u64 != self.block_size {
+                    return Err(SahneError::InvalidOperation); // Buffer boyutu blok boyutuna eşit olmalı
+                }
+
+                 // Burada ideal olarak bir seek işlemi olurdu:
+                 resource::control(*handle, resource::CONTROL_SEEK, offset)?;
+
+
+                let write_result = resource::write(*handle, buffer); // fs::write yerine resource::write kullanıldı
                 match write_result {
                     Ok(bytes_written) => {
+                         // resource::write kaç byte yazdığını dönmeli.
+                         // Blok cihaz trait'i tam blok yazmayı bekler.
                         if bytes_written == buffer.len() {
-                            Ok(bytes_written)
-                        } else {
-                            Err(SahneError::InvalidOperation) // Tamamen yazılamadı
-                        }
+                             Ok(bytes_written)
+                         } else {
+                             // Tam blok yazamadık, bu bir hata.
+                             Err(SahneError::CommunicationError) // Veya daha spesifik bir hata
+                         }
                     }
                     Err(e) => Err(e),
                 }
@@ -148,17 +166,21 @@ impl AbstractDevice for BlockDevice {
 }
 
 // #[cfg(feature = "std")] // main fonksiyonu sadece standart kütüphane varsa derlensin
+// Örnek kullanım, Sahne64 API'sına göre güncellendi.
 fn main() -> Result<(), SahneError> {
-    let file_path = "/path/to/disk.img"; // Sahne64 dosya sistemi yolu
+    let resource_id = "sahne://devices/disk0"; // Sahne64 kaynak tanımlayıcısı
 
-    // Dosya açma modları için Sahne64 sabitlerini kullanıyoruz
-    let flags = fs::O_RDWR | fs::O_CREAT | fs::O_TRUNC;
-    let open_result = fs::open(file_path, flags);
+    // Kaynak açma modları için Sahne64 sabitlerini kullanıyoruz
+    let flags = resource::MODE_READ | resource::MODE_WRITE | resource::MODE_CREATE | resource::MODE_TRUNCATE; // fs::O_* yerine resource::MODE_* kullanıldı
+    let acquire_result = resource::acquire(resource_id, flags); // fs::open yerine resource::acquire kullanıldı
 
-    let fd = match open_result {
-        Ok(fd) => fd,
+    let device_handle_val = match acquire_result {
+        Ok(handle) => {
+            println!("Kaynak edinildi ('{}'), Handle: {:?}", resource_id, handle);
+            handle
+        },
         Err(e) => {
-            eprintln!("Dosya açma hatası: {:?}", e);
+            eprintln!("Kaynak edinme hatası: {:?}", e);
             return Err(e);
         }
     };
@@ -167,16 +189,20 @@ fn main() -> Result<(), SahneError> {
     let block_count = 1024;
     let device_size = block_size * block_count;
 
-    // Sahne64'te dosya boyutunu ayarlamak için bir sistem çağrısı gerekebilir.
-    // Şimdilik bu adımı atlıyoruz veya varsayıyoruz ki dosya açma modları bunu hallediyor.
+    // Sahne64'te kaynağın boyutunu ayarlamak için bir sistem çağrısı gerekebilir (örn. resource::control ile bir SET_SIZE komutu).
+    // acquire modlarındaki TRUNCATE belki yeterlidir, ama kaynağın istenen boyuta ulaştığından emin olmak gerekir.
+    resource::control(device_handle_val, resource::CONTROL_SET_SIZE, device_size)?;
 
-    let device_handle = DeviceHandle::File(fd);
+
+    let device_handle = DeviceHandle::Resource(device_handle_val); // Handle kullanıldı
     let mut block_device = BlockDevice::new(device_handle, block_size, block_count);
 
     let mut read_buffer = [0u8; 512]; // Blok boyutunda okuma arabelleği
-    let write_buffer = [42u8; 512];     // Blok boyutunda yazma arabelleği
+    let write_buffer = [42u8; 512];    // Blok boyutunda yazma arabelleği
 
     // Blok 10'a yazma
+    // Not: Bu yazma işlemi, resource::write'ın offset'i otomatik yönettiğini veya
+    // yukarıdaki yorumda belirtildiği gibi seek benzeri bir mekanizma kullanıldığını varsayar.
     let write_result = block_device.write_block(10, &write_buffer);
     match write_result {
         Ok(_) => println!("Blok 10'a yazma başarılı."),
@@ -184,21 +210,22 @@ fn main() -> Result<(), SahneError> {
     }
 
     // Blok 10'dan okuma
+    // Not: Benzer şekilde, bu okuma işlemi de offset yönetimini varsayar.
     let read_result = block_device.read_block(10, &mut read_buffer);
     match read_result {
         Ok(bytes_read) => {
             println!("Blok 10'dan {} byte okundu.", bytes_read);
             // Burada okunan veriyi kontrol etmek isteyebilirsiniz.
-            // Örneğin: assert_eq!(read_buffer, write_buffer);
+            assert_eq!(read_buffer, write_buffer);
         }
         Err(e) => eprintln!("Blok 10'dan okuma hatası: {:?}", e),
     }
 
-    // Dosyayı kapatma
-    let close_result = fs::close(fd);
-    match close_result {
-        Ok(_) => println!("Dosya kapatıldı."),
-        Err(e) => eprintln!("Dosya kapatma hatası: {:?}", e),
+    // Kaynağı serbest bırakma
+    let release_result = resource::release(device_handle_val); // fs::close yerine resource::release kullanıldı
+    match release_result {
+        Ok(_) => println!("Kaynak serbest bırakıldı."),
+        Err(e) => eprintln!("Kaynak serbest bırakma hatası: {:?}", e),
     }
 
     Ok(())
@@ -211,23 +238,54 @@ fn main() -> Result<(), SahneError> {
 mod print {
     use core::fmt;
     use core::fmt::Write;
+    use crate::resource; // resource modülünü kullanmak için import edildi
+    use crate::SahneError; // Hata tipini kullanmak için import edildi
+    use crate::Handle; // Handle tipini kullanmak için import edildi
+
+    // TODO: Konsol Handle'ı bir yerden alınmalı.
+    // Bu, görevin başlatılması sırasında argüman olarak verilebilir veya
+    // resource::acquire("sahne://devices/console", ...) gibi bir çağrı ile edinilebilir.
+    // Şimdilik dummy bir Handle kullanıyoruz.
+    // Gerçek sistemde bu global mutable static bir değişken olabilir (unsafe gerektirir)
+    // veya thread-local depolama kullanılabilir.
+    static mut CONSOLE_HANDLE: Option<Handle> = None;
+
+    pub fn init_console(handle: Handle) {
+        unsafe {
+            CONSOLE_HANDLE = Some(handle);
+        }
+    }
 
     struct Stdout;
 
     impl fmt::Write for Stdout {
         fn write_str(&mut self, s: &str) -> fmt::Result {
-            // Burada gerçek çıktı mekanizmasına (örneğin, bir UART sürücüsüne) erişim olmalı.
-            // Bu örnekte, çıktı kaybolacaktır çünkü gerçek bir çıktı yok.
-            // Gerçek bir işletim sisteminde, bu kısım donanıma özel olacaktır.
-            Ok(())
+            unsafe {
+                if let Some(handle) = CONSOLE_HANDLE {
+                    // Gerçek çıktı mekanizmasına (örneğin, bir konsol kaynağına) resource::write ile erişim.
+                    // Hata durumunu basitçe yoksayıyoruz veya panic yapabiliriz.
+                    let write_result = resource::write(handle, s.as_bytes());
+                     // println!/print! içinde hata yönetimi genellikle istenmez,
+                     // bu yüzden unwrap() veya basit hata yoksayma yaygındır.
+                    if write_result.is_err() {
+                         // Hata durumunu bir yere kaydetmek isteyebiliriz, ama burası kısıtlı bir ortam.
+                         // Belki de daha ilkel bir çıktı mekanizması kullanılır.
+                    }
+                    Ok(())
+                } else {
+                    // Konsol handle'ı ayarlanmamışsa, çıktıyı yoksay.
+                    Err(fmt::Error) // Veya başka bir hata
+                }
+            }
         }
     }
 
     #[macro_export]
     macro_rules! print {
         ($($arg:tt)*) => ({
-            let mut stdout = $crate::print::Stdout;
-            core::fmt::write(&mut stdout, core::format_args!($($arg)*)).unwrap();
+            use core::fmt::Write;
+            let mut stdout = $crate::print::Stdout; // $crate kullanımı modül yolunu belirtir
+            let _ = core::fmt::write(&mut stdout, core::format_args!($($arg)*)); // Hata durumunu yoksay
         });
     }
 
@@ -236,10 +294,28 @@ mod print {
         () => ($crate::print!("\n"));
         ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
     }
+
+    #[macro_export]
+    macro_rules! eprintln {
+        () => ($crate::print!("\n")); // Şimdilik stderr yok, stdout'a yaz
+        ($($arg:tt)*) => ($crate::print!("{}\n", format_args!($($arg)*)));
+    }
 }
 
 #[cfg(not(feature = "std"))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
-    loop {}
+fn panic(info: &core::panic::PanicInfo) -> ! {
+    // no_std panic'te çıktı alabilmek için print! makrosunu kullan
+    #[cfg(not(feature = "std"))] // print makrosu sadece no_std ortamında aktif
+    {
+        println!("{}", info);
+    }
+    // Gerçek sistemde burada bir hata kaydı, sistem reset veya sonsuz döngü olabilir.
+    loop {
+        core::hint::spin_loop(); // İşlemciyi meşgul etmeden bekle
+    }
 }
+
+// Re-export macros in no_std mode
+#[cfg(not(feature = "std"))]
+pub use print::{print, println, eprintln};
