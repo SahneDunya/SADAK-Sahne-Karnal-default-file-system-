@@ -1,5 +1,5 @@
 #![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
-// #![cfg_attr(not(feature = "std"), no_std)] // This file relies heavily on std features of zip and io
+#![cfg_attr(not(feature = "std"), no_std)] // This file relies heavily on std features of zip and io
 
 // no_std ortamında alloc crate'inden gelen yapıları kullanabilmek için (if any alloc is used)
 #[cfg_attr(not(feature = "std"), macro_use)]
