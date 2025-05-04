@@ -1,220 +1,226 @@
-#![allow(dead_code)]
+#![allow(dead_code)] // Henüz kullanılmayan kodlar için uyarı vermesin
 
+// no_std ortamında print/println kullanabilmek için makroları içeri aktar
+// Eğer std feature'ı aktifse, Rust'ın kendi println!'i kullanılır.
+// Değilse, bizim tanımladığımız no_std uyumlu makrolar kullanılır.
+#[cfg_attr(not(feature = "std"), macro_use)]
+extern crate alloc; // 'vec!' kullanımı için alloc crate'ini gerektirir
+
+// Gerekli Sahne64 modüllerini içeri aktar
 use crate::{
-    blockdevice::{BlockDevice, SeekFrom}, // Import the BlockDevice trait and SeekFrom enum
-    config, // Import file system configuration
-    SahneError, // Import SahneError
-    // Add other necessary Sahne64 modules if needed, e.g., resource, sync
+    resource, // fs modülü yerine resource modülü kullanıldı
+    memory,
+    task,     // process modülü yerine task modülü kullanıldı
+    sync,
+    kernel,
+    SahneError,
+    arch,
+    Handle,   // Handle tipi eklendi
 };
 
-// Data block management structure
-pub struct DataBlocksManager<'a> {
-    // Reference to the underlying block device.
-    // 'a lifetime ensures the manager doesn't outlive the device.
-    device: &'a mut dyn BlockDevice,
-    // We might need a reference to the Free Space Manager here later
-    // free_space_manager: &'a mut dyn FreeSpaceManager,
+use core::result::Result;
+use core::cmp::min; // core::cmp::min kullanıldı
+
+// DataBlocks yapısı, sabit boyutlu bloklar halinde veri depolamak ve yönetmek için kullanılır.
+pub struct DataBlocks {
+    handle: Handle,     // Sahne64 kaynak Handle'ı (fd yerine)
+    block_size: u32,    // Her bir veri bloğunun boyutu (bayt cinsinden).
 }
 
-impl<'a> DataBlocksManager<'a> {
-    /// Creates a new DataBlocksManager.
-    ///
-    /// # Arguments
-    ///
-    /// * `device` - A mutable reference to the underlying BlockDevice.
-    pub fn new(device: &'a mut dyn BlockDevice) -> Self {
-        DataBlocksManager {
-            device,
-            // free_space_manager: ...,
-        }
+impl DataBlocks {
+    /// `DataBlocks::new`, yeni bir `DataBlocks` örneği oluşturur ve belirtilen Sahne64 kaynağını edinir.
+    pub fn new(resource_id: &str, block_size: u32) -> Result<DataBlocks, SahneError> {
+        // `resource::acquire` ile kaynağı edinme işlemleri yapılandırılır.
+        let flags = resource::MODE_READ | resource::MODE_WRITE | resource::MODE_CREATE; // Okuma/yazma ve oluşturma modunda edin
+        let handle = resource::acquire(resource_id, flags)?; // Belirtilen kaynak tanımlayıcısı ile kaynağı edinir.
+
+        // Yeni `DataBlocks` örneği oluşturulur ve başarılı sonuç döndürülür.
+        Ok(DataBlocks { handle, block_size })
     }
 
-    /// Reads a specific logical data block.
-    ///
-    /// # Arguments
-    ///
-    /// * `logical_block_number` - The number of the data block relative to DATA_BLOCKS_LOCATION.
-    /// * `buffer` - The buffer to store the block data. Must be config::BLOCK_SIZE.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(bytes_read)` (expected to be config::BLOCK_SIZE) on success,
-    /// or a `SahneError` on failure.
-    pub fn read_data_block(&mut self, logical_block_number: u64, buffer: &mut [u8]) -> Result<usize, SahneError> {
-        // Ensure the buffer size matches the configured block size
-        if buffer.len() as u32 != config::BLOCK_SIZE {
-            println!("ERROR: read_data_block buffer size mismatch. Expected: {}, Got: {}", config::BLOCK_SIZE, buffer.len());
-            return Err(SahneError::InvalidParameter); // Or a more specific error
-        }
-
-        // Calculate the physical offset on the underlying device
-        let physical_block_number = config::DATA_BLOCKS_LOCATION + logical_block_number;
-        let offset = physical_block_number * config::BLOCK_SIZE as u64;
-
-        // Read from the block device at the calculated offset.
-        // NOTE: This relies on the underlying BlockDevice implementation (e.g., ResourceBlockDevice)
-        // correctly handling the 'offset' parameter. As noted in ResourceBlockDevice,
-        // the current Sahne64 resource::read/write API *ignores* the offset.
-        // This call will likely read from the beginning of the resource unless seek works.
-        self.device.read(offset, buffer)
-         // The BlockDevice::read should return the number of bytes read.
-         // For a block device layer, we typically expect to read the full block size.
-         // Additional checks might be needed here to ensure the full block was read.
+    /// Kaynak Handle'ını serbest bırakır.
+    pub fn close(&mut self) -> Result<(), SahneError> {
+        resource::release(self.handle)
     }
 
-    /// Writes data to a specific logical data block.
+    /// `read_block`, belirli bir blok numarasındaki veriyi verilen buffer'a okur.
     ///
-    /// # Arguments
-    ///
-    /// * `logical_block_number` - The number of the data block relative to DATA_BLOCKS_LOCATION.
-    /// * `buffer` - The buffer containing the block data. Must be config::BLOCK_SIZE.
-    ///
-    /// # Returns
-    ///
-    /// Returns `Ok(bytes_written)` (expected to be config::BLOCK_SIZE) on success,
-    /// or a `SahneError` on failure.
-    pub fn write_data_block(&mut self, logical_block_number: u64, buffer: &[u8]) -> Result<usize, SahneError> {
-        // Ensure the buffer size matches the configured block size
-        if buffer.len() as u32 != config::BLOCK_SIZE {
-            println!("ERROR: write_data_block buffer size mismatch. Expected: {}, Got: {}", config::BLOCK_SIZE, buffer.len());
-            return Err(SahneError::InvalidParameter); // Or a more specific error
+    /// # DİKKAT: Sahne64 API Kısıtlaması
+    /// Sahne64 resource::read syscall'ı doğrudan ofset parametresi almaz.
+    /// resource::read muhtemelen kaynağın mevcut konumundan okur.
+    /// Bu implementasyon, `block_number`'dan hesaplanan ofseti DOĞRUDAN KULLANMAZ.
+    /// Bunun yerine, kaynağın mevcut konumundan okuma yapar. Gerçek bir blok cihazı
+    /// gibi çalışması için Sahne64 API'sına ofsetli okuma/yazma veya seek syscall'ı
+    /// eklenmelidir.
+    pub fn read_block(&mut self, block_number: u64, buffer: &mut [u8]) -> Result<usize, SahneError> {
+        let offset = block_number * self.block_size as u64; // Blok başlangıç pozisyonu hesaplanır (ancak kullanılmaz).
+
+        // TODO: Eğer Sahne64'te seek benzeri bir resource::control komutu varsa,
+        // burada önce o komut çağrılarak offset ayarlanmalıdır:
+        // resource::control(self.handle, resource::CONTROL_SEEK, offset)?;
+        // Ardından resource::read çağrılır.
+
+        // Şimdilik, offset parametresini yoksayarak doğrudan okuyoruz.
+        // BU YANLIŞ DAVRANIŞTIR, Sahne64 API'sındaki eksikliği yansıtır.
+        println!("WARN: DataBlocks::read_block block_number {} (offset {}) parametresini yoksayıyor!", block_number, offset); // no_std print makrosu
+
+        if buffer.len() as u32 != self.block_size {
+             println!("ERROR: DataBlocks::read_block buffer boyutu blok boyutuna ({}) eşit değil ({})!", self.block_size, buffer.len());
+             return Err(SahneError::InvalidParameter); // Buffer boyutu blok boyutuna eşit olmalı
         }
 
-        // Calculate the physical offset on the underlying device
-        let physical_block_number = config::DATA_BLOCKS_LOCATION + logical_block_number;
-        let offset = physical_block_number * config::BLOCK_SIZE as u64;
-
-        // Write to the block device at the calculated offset.
-        // NOTE: This relies on the underlying BlockDevice implementation (e.g., ResourceBlockDevice)
-        // correctly handling the 'offset' parameter. As noted in ResourceBlockDevice,
-        // the current Sahne64 resource::write/write API *ignores* the offset.
-        // This call will likely write to the beginning of the resource unless seek works.
-        self.device.write(offset, buffer)
-        // The BlockDevice::write should return the number of bytes written.
-        // For a block device layer, we typically expect to write the full block size.
-        // Additional checks might be needed here to ensure the full block was written.
+        resource::read(self.handle, buffer) // resource::read kullanıldı
+         // Okuma başarılıysa, okunan byte sayısını döndürür.
+         // resource::read tam olarak buffer.len() okumayabilir (örn. dosya sonu).
+         // Blok cihaz mantığı tam blok okumayı bekler, bu durum burada ele alınmalıdır.
     }
 
-    // Future methods would include block allocation and deallocation.
-     pub fn allocate_block(...) -> Result<u64, SahneError> { ... }
-     pub fn free_block(...) -> Result<(), SahneError> { ... }
+    /// `write_block`, verilen buffer'daki veriyi belirli bir blok numarasına yazar.
+     ///
+     /// # DİKKAT: Sahne64 API Kısıtlaması
+     /// Sahne64 resource::write syscall'ı doğrudan ofset parametresi almaz.
+     /// resource::write muhtemelen kaynağın mevcut konumundan yazar.
+     /// Bu implementasyon, `block_number`'dan hesaplanan ofseti DOĞRUDAN KULLANMAZ.
+     /// Bunun yerine, kaynağın mevcut konumuna yazma yapar. Gerçek bir blok cihazı
+     /// gibi çalışması için Sahne64 API'sına ofsetli okuma/yazma veya seek syscall'ı
+     /// eklenmelidir.
+    pub fn write_block(&mut self, block_number: u64, buffer: &[u8]) -> Result<usize, SahneError> {
+        let offset = block_number * self.block_size as u64; // Blok başlangıç pozisyonu hesaplanır (ancak kullanılmaz).
+        // TODO: Eğer Sahne64'te seek benzeri bir resource::control komutu varsa,
+        // burada önce o komut çağrılarak offset ayarlanmalıdır:
+        // resource::control(self.handle, resource::CONTROL_SEEK, offset)?;
+        // Ardından resource::write çağrılır.
+
+        // Şimdilik, offset parametresini yoksayarak doğrudan yazıyoruz.
+        // BU YANLIŞ DAVRANIŞTIR, Sahne64 API'sındaki eksikliği yansıtır.
+         println!("WARN: DataBlocks::write_block block_number {} (offset {}) parametresini yoksayıyor!", block_number, offset); // no_std print makrosu
+
+         if buffer.len() as u32 != self.block_size {
+             println!("ERROR: DataBlocks::write_block buffer boyutu blok boyutuna ({}) eşit değil ({})!", self.block_size, buffer.len());
+             return Err(SahneError::InvalidParameter); // Buffer boyutu blok boyutuna eşit olmalı
+         }
+
+
+        resource::write(self.handle, buffer) // resource::write kullanıldı
+         // Yazma başarılıysa, yazılan byte sayısını döndürür.
+         // resource::write tam olarak buffer.len() yazmayabilir (örn. disk dolu).
+         // Blok cihaz mantığı tam blok yazmayı bekler, bu durum burada ele alınmalıdır.
+    }
+
+    /// `block_count`, dosyada kaç blok olduğunu hesaplar ve döndürür.
+    ///
+    /// # DİKKAT: Sahne64 API Kısıtlaması
+    /// Sahne64 API'sında kaynağın toplam boyutunu almak için doğrudan bir syscall yok gibi.
+    /// Bu nedenle tam blok sayısını hesaplamak mümkün değildir.
+    pub fn block_count(&mut self) -> Result<u64, SahneError> {
+        // TODO: Sahne64'te resource::control ile size almak mümkünse, file_size'ı çağırıp hesapla.
+        // match self.file_size() {
+        //     Ok(size) => Ok(size / self.block_size as u64),
+        //     Err(e) => Err(e),
+        // }
+        println!("WARN: DataBlocks::block_count henüz desteklenmiyor!"); // no_std print makrosu
+        Err(SahneError::NotSupported) // Veya uygun hata
+    }
+
+    /// `file_size`, kaynağın toplam boyutunu bayt cinsinden döndürür.
+    ///
+    /// # DİKKAT: Sahne64 API Kısıtlaması
+    /// Sahne64 API'sında kaynağın toplam boyutunu almak için doğrudan bir syscall yok gibi.
+    pub fn file_size(&mut self) -> Result<u64, SahneError> {
+        // TODO: Sahne64'te resource::control ile size almak mümkünse, implemente et.
+        // Örneğin: resource::control(self.handle, resource::CONTROL_GET_SIZE, 0) gibi.
+        println!("WARN: DataBlocks::file_size henüz desteklenmiyor!"); // no_std print makrosu
+        Err(SahneError::NotSupported) // Veya uygun hata
+    }
 }
 
-// Example usage (requires a BlockDevice instance)
-#[cfg(feature = "example_datablocks")] // Use a specific feature flag for this example
+// Gerekli SeekFrom tanımı (Bu dosya için redundant, başka yerde tanımlanmalı)
+// #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// pub enum SeekFrom { ... } // Bu enum'u bu dosyadan kaldırdık, başka yerde tanımlı olmalı.
+
+
+// Örnek kullanım (Bu fonksiyonun kendisi std veya alloc gerektirebilir)
+// Gerçek bir Sahne64 uygulamasında entry point başka bir yerde olacaktır.
+#[cfg(feature = "example")] // Sadece 'example' özelliği aktifse derle
 fn main() -> Result<(), SahneError> {
-    // This example is illustrative and needs a concrete BlockDevice instance.
-    // In a real scenario, you'd pass a ResourceBlockDevice (or MemBlockDevice if enabled).
+    // no_std ortamında print/println makrolarının kullanılabilir olduğundan emin olun.
+    #[cfg(not(feature = "std"))]
+    crate::init_console(crate::Handle(3)); // Varsayımsal konsol handle'ı ayarlama
 
-    // Dummy BlockDevice implementation for example purposes only
-    struct DummyBlockDevice {
-        block_size: u64,
-        // Simulate some data storage that respects offset
-        data: alloc::vec::Vec<u8>, // Requires 'alloc'
-    }
+    let resource_id = "sahne://data/my_filesystem_data"; // Sahne64 kaynak tanımlayıcısı
+    let block_size = 128;
 
-    #[cfg(any(feature = "std", feature = "alloc"))] // Dummy requires alloc
-    impl BlockDevice for DummyBlockDevice {
-         fn block_size(&self) -> u64 { self.block_size }
-         fn size(&self) -> Result<u64, SahneError> { Ok(self.data.len() as u64) }
-         fn seek(&mut self, pos: SeekFrom) -> Result<u64, SahneError> {
-             // Dummy seek - real seek updates internal state
-             println!("DummyBlockDevice::seek called with {:?}", pos);
-             Ok(0) // Just return 0 for simplicity in dummy
+    // 1. DataBlocks örneği oluşturma (Sahne64 kaynağını edinir)
+    let mut data_blocks = match DataBlocks::new(resource_id, block_size) {
+         Ok(db) => db,
+         Err(e) => {
+             eprintln!("DataBlocks başlatma hatası ('{}'): {:?}", resource_id, e);
+             return Err(e);
          }
+    };
+    println!("Kaynak '{}' başarıyla edinildi ve DataBlocks yöneticisi başlatıldı.", resource_id);
 
-         // Dummy read that actually respects offset
-         fn read(&mut self, offset: u64, buf: &mut [u8]) -> Result<usize, SahneError> {
-             let offset_usize = offset as usize;
-             let len = buf.len();
-             println!("DummyBlockDevice::read called with offset {} and buffer len {}", offset, len);
+    // 2. Bir bloğa veri yazma
+    let write_block_number = 5; // 5 numaralı bloğa yazılacak.
+    let write_data: alloc::vec::Vec<u8> = (0..block_size).map(|i| (i % 256) as u8).collect(); // Örnek veri (alloc gerektirir)
 
-             if offset_usize >= self.data.len() {
-                 return Ok(0);
+    // DİKKAT: write_block şu an ofseti yoksayıyor! Muhtemelen 0. bloka yazar.
+    println!("{} numaralı bloğa (offset {}) yazma denemesi...", write_block_number, write_block_number as u64 * block_size as u64);
+    match data_blocks.write_block(write_block_number as u64, &write_data) {
+        Ok(bytes_written) => {
+             println!("Yazma başarılı ({} bayt yazıldı).", bytes_written);
+             if bytes_written != block_size as usize {
+                 println!("UYARI: Tam blok ({}) yazılamadı!", block_size);
              }
+        }
+        Err(e) => eprintln!("Yazma hatası: {:?}", e),
+    }
 
-             let read_len = min(len, self.data.len() - offset_usize);
-             buf[..read_len].copy_from_slice(&self.data[offset_usize..offset_usize + read_len]);
-             Ok(read_len)
-         }
+    // 3. Aynı bloktan veri okuma
+    let read_block_number = 5; // Yazılan bloktan okunacak (ancak ofset yine yoksayılır).
+    let mut read_buffer = alloc::vec![0u8; block_size as usize]; // Okuma için buffer oluşturulur (alloc gerektirir).
 
-         // Dummy write that actually respects offset
-         fn write(&mut self, offset: u64, buf: &[u8]) -> Result<usize, SahneError> {
-             let offset_usize = offset as usize;
-             let len = buf.len();
-              println!("DummyBlockDevice::write called with offset {} and buffer len {}", offset, len);
-
-             if offset_usize >= self.data.len() {
-                 return Ok(0);
+    // DİKKAT: read_block şu an ofseti yoksayıyor! Muhtemelen 0. bloktan okur.
+     println!("{} numaralı bloktan (offset {}) okuma denemesi...", read_block_number, read_block_number as u64 * block_size as u64);
+    match data_blocks.read_block(read_block_number as u64, &mut read_buffer) {
+        Ok(bytes_read) => {
+             println!("Okuma başarılı ({} bayt okundu).", bytes_read);
+             if bytes_read > 0 {
+                  println!("Okunan ilk 10 byte: {:?}", &read_buffer[..min(10, bytes_read)]);
              }
-
-             let write_len = min(len, self.data.len() - offset_usize);
-             self.data[offset_usize..offset_usize + write_len].copy_from_slice(&buf[..write_len]);
-             Ok(write_len)
-         }
+        }
+        Err(e) => eprintln!("Okuma hatası: {:?}", e),
     }
 
-    #[cfg(any(feature = "std", feature = "alloc"))] // Dummy requires alloc
-    {
-        // Create a dummy device that's 20 blocks large, with 512 byte blocks
-        let total_device_size = (config::DATA_BLOCKS_LOCATION + 20) * config::BLOCK_SIZE as u64;
-        let mut dummy_device = DummyBlockDevice {
-            block_size: config::BLOCK_SIZE as u64,
-            data: alloc::vec![0u8; total_device_size as usize],
-        };
+     // 4. Yazılan ve okunan veriyi karşılaştırma (std veya alloc gerektirir)
+     // DİKKAT: Ofset sorunları nedeniyle bu karşılaştırma büyük olasılıkla başarısız olacaktır.
+     // Çünkü yazma ve okuma muhtemelen farklı konumlara gerçekleşmiştir.
+     #[cfg(any(feature = "std", feature = "alloc"))]
+     if write_data == read_buffer {
+         println!("Yazılan ve okunan veriler (muhtemelen offset 0'dan) eşleşiyor.");
+     } else {
+         println!("Yazılan ve okunan veriler EŞLEŞMİYOR. (Ofset sorunları nedeniyle bekleniyor).");
+     }
 
-        // Create the DataBlocksManager with the dummy device
-        let mut data_manager = DataBlocksManager::new(&mut dummy_device);
 
-        let mut read_buffer = alloc::vec![0u8; config::BLOCK_SIZE as usize];
-        let write_buffer_1 = alloc::vec![1u8; config::BLOCK_SIZE as usize];
-        let write_buffer_2 = alloc::vec![2u8; config::BLOCK_SIZE as usize];
-
-        // Write to logical data block 0 (physical block DATA_BLOCKS_LOCATION)
-        println!("Writing to logical data block 0...");
-        match data_manager.write_data_block(0, &write_buffer_1) {
-            Ok(bytes_written) => println!("Wrote {} bytes to logical block 0.", bytes_written),
-            Err(e) => eprintln!("Error writing to logical block 0: {:?}", e),
-        }
-
-        // Write to logical data block 5 (physical block DATA_BLOCKS_LOCATION + 5)
-        println!("Writing to logical data block 5...");
-        match data_manager.write_data_block(5, &write_buffer_2) {
-            Ok(bytes_written) => println!("Wrote {} bytes to logical block 5.", bytes_written),
-            Err(e) => eprintln!("Error writing to logical block 5: {:?}", e),
-        }
-
-        // Read from logical data block 0
-        println!("Reading from logical data block 0...");
-        match data_manager.read_data_block(0, &mut read_buffer) {
-            Ok(bytes_read) => {
-                println!("Read {} bytes from logical block 0. First 10 bytes: {:?}", bytes_read, &read_buffer[..min(10, bytes_read)]);
-                 // In a real test, you'd assert read_buffer == write_buffer_1
-            },
-            Err(e) => eprintln!("Error reading from logical block 0: {:?}", e),
-        }
-
-        // Read from logical data block 5
-        println!("Reading from logical data block 5...");
-        match data_manager.read_data_block(5, &mut read_buffer) {
-            Ok(bytes_read) => {
-                println!("Read {} bytes from logical block 5. First 10 bytes: {:?}", bytes_read, &read_buffer[..min(10, bytes_read)]);
-                 // In a real test, you'd assert read_buffer == write_buffer_2
-            },
-            Err(e) => eprintln!("Error reading from logical block 5: {:?}", e),
-        }
-
-        // Attempt to read from an unwritten block (e.g., logical block 1)
-        println!("Reading from logical data block 1 (unwritten)...");
-         match data_manager.read_data_block(1, &mut read_buffer) {
-            Ok(bytes_read) => {
-                 println!("Read {} bytes from logical block 1. First 10 bytes: {:?}", bytes_read, &read_buffer[..min(10, bytes_read)]);
-                 // Expected to be all zeros if device was initialized to zero
-            },
-             Err(e) => eprintln!("Error reading from logical block 1: {:?}", e),
-         }
-
+    // 5. Blok sayısını kontrol etme (henüz Sahne64 API'sında desteklenmiyor)
+    match data_blocks.block_count() {
+        Ok(block_count) => println!("Kaynak blok sayısı: {}", block_count),
+        Err(e) => eprintln!("Blok sayısı alınamadı: {:?}", e), // Muhtemelen NotSupported dönecektir
     }
+
+    // 6. Kaynak boyutunu kontrol etme (henüz Sahne64 API'sında desteklenmiyor)
+    match data_blocks.file_size() {
+        Ok(file_size) => println!("Kaynak boyutu: {} bayt", file_size),
+        Err(e) => eprintln!("Kaynak boyutu alınamadı: {:?}", e), // Muhtemelen NotSupported dönecektir
+    }
+
+    // Kaynağı serbest bırakma
+     match data_blocks.close() {
+         Ok(_) => println!("Kaynak serbest bırakıldı."),
+         Err(e) => eprintln!("Kaynak serbest bırakma hatası: {:?}", e),
+     }
+
 
     Ok(())
 }
